@@ -1,0 +1,474 @@
+/**
+ *Submitted for verification at BscScan.com on 2025-10-04
+*/
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+abstract contract ReentrancyGuard {
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+    uint256 private status = NOT_ENTERED;
+
+    modifier nonReentrant() {
+        require(status != ENTERED, "Reentrant call");
+        status = ENTERED;
+        _;
+        status = NOT_ENTERED;
+    }
+}
+
+contract MatrixMLM_Fixed is ReentrancyGuard {
+    IERC20 public usdtToken;
+    address public companyWallet;
+    
+    uint256 public constant PACKAGE_PRICE = 50 * 1e18; // $50 USDT (18 decimals - BSC)
+    uint256 public constant MATRIX_SIZE = 5;
+    uint256 public constant MAX_LEVEL = 10;
+    uint256 public constant maxDailyWithdrawals = 10000 * 1e18; // $10,000
+    
+    // ✅ FIXED: Commission percentages (basis points) - L1:20%, L2:10%, L3:5%, L4:4%, L5:3%, L6:2%, L7-10:1%
+    uint256[10] public levelCommissions = [2000, 1000, 500, 400, 300, 200, 100, 100, 100, 100];
+    
+    // Rank reward amounts
+    uint256[9] public rankRewardAmounts = [
+        100 * 1e18,   // Star 1: $100
+        250 * 1e18,   // Star 2: $250
+        500 * 1e18,   // Star 3: $500
+        1000 * 1e18,  // Star 4: $1000
+        2500 * 1e18,  // Star 5: $2500
+        5000 * 1e18,  // Star 6: $5000
+        10000 * 1e18, // Star 7: $10000
+        25000 * 1e18, // Star 8: $25000
+        50000 * 1e18  // Star 9: $50000
+    ];
+    
+    // Rank requirements [Star][Level] = required members
+    uint256[9][9] public rankLevelRequirements;
+    
+    struct User {
+        address upline;
+        uint256 totalEarnings;
+        uint256 networkSize;
+        uint256 matrixEntries;
+        uint256 matrixPayouts;
+        uint8 rank;
+        uint8 unlockedLevels;
+        bool active;
+        address[] directRefs;
+        uint256[10] levelCounts;
+    }
+    
+    struct MatrixNode {
+        address user;
+        uint256 parentId;
+        uint8 children;
+        bool completed;
+        uint256 timestamp;
+    }
+    
+    mapping(address => User) public users;
+    mapping(address => uint256) public dailyWithdrawn;
+    mapping(address => uint256) public lastWithdrawalDay;
+    mapping(address => mapping(uint8 => bool)) public rankRewardClaimed;
+    mapping(address => uint256[]) public userMatrixNodes;
+    
+    MatrixNode[] public matrixNodes;
+    uint256 public nextPlacementIndex;
+    
+    uint256 public totalUsers;
+    uint256 public activeUsers;
+    uint256 public totalCommissionsPaid;
+    uint256 public totalMatrixPayouts;
+    uint256 public totalReserves;
+    uint256 public totalRankRewardPool;
+    uint256 public totalRankRewardsPaid;
+    
+    modifier validUser() {
+        require(users[msg.sender].active, "User not active");
+        _;
+    }
+    
+    event UserRegistered(address indexed user, address indexed upline, uint256 amount);
+    event CommissionPaid(address indexed to, address indexed from, uint256 amount, uint8 level);
+    event MatrixPayout(address indexed to, address indexed from, uint256 nodeId, uint256 amount);
+    event MatrixCompleted(address indexed user, uint256 nodeId, uint256 totalEarned);
+    event MatrixEntry(address indexed user, uint256 nodeId, uint256 parentId);
+    event Withdrawal(address indexed user, uint256 amount);
+    event CompanyPayment(address indexed company, uint256 amount);
+    event ReserveUpdate(uint256 totalReserves, uint256 contractBalance);
+    event RankUpgraded(address indexed user, uint8 newRank);
+    event RankRewardPaid(address indexed user, uint8 rank, uint256 amount);
+    
+    constructor(address _usdtToken, address _companyWallet) {
+        usdtToken = IERC20(_usdtToken);
+        companyWallet = _companyWallet;
+        
+        // Initialize root matrix node (company wallet)
+        matrixNodes.push(MatrixNode({
+            user: address(0),
+            parentId: 0,
+            children: 0,
+            completed: false,
+            timestamp: block.timestamp
+        }));
+        
+        _initializeRankRequirements();
+    }
+    
+    function _initializeRankRequirements() internal {
+        rankLevelRequirements[0] = [2, 0, 0, 0, 0, 0, 0, 0, 0];      // Star 1: 2 Level 1
+        rankLevelRequirements[1] = [4, 2, 0, 0, 0, 0, 0, 0, 0];      // Star 2: 4 L1, 2 L2
+        rankLevelRequirements[2] = [6, 4, 2, 0, 0, 0, 0, 0, 0];      // Star 3: 6 L1, 4 L2, 2 L3
+        rankLevelRequirements[3] = [8, 6, 4, 2, 0, 0, 0, 0, 0];      // Star 4
+        rankLevelRequirements[4] = [10, 8, 6, 4, 2, 0, 0, 0, 0];     // Star 5
+        rankLevelRequirements[5] = [12, 10, 8, 6, 4, 2, 0, 0, 0];    // Star 6
+        rankLevelRequirements[6] = [14, 12, 10, 8, 6, 4, 2, 0, 0];   // Star 7
+        rankLevelRequirements[7] = [16, 14, 12, 10, 8, 6, 4, 2, 0];  // Star 8
+        rankLevelRequirements[8] = [20, 18, 16, 14, 12, 10, 8, 6, 4]; // Star 9
+    }
+    
+    function registerUser(address upline, uint256 entries) external {
+        require(!users[msg.sender].active, "Already registered");
+        require(entries > 0 && entries <= 100, "Invalid entries count");
+        
+        if (upline == address(0) || !users[upline].active) {
+            upline = address(0);
+        }
+        
+        uint256 totalAmount = PACKAGE_PRICE * entries;
+        
+        require(
+            usdtToken.transferFrom(msg.sender, address(this), totalAmount),
+            "USDT transfer failed"
+        );
+        
+        users[msg.sender].active = true;
+        users[msg.sender].upline = upline;
+        users[msg.sender].matrixEntries = entries;
+        
+        totalUsers++;
+        activeUsers++;
+        
+        if (upline != address(0)) {
+            users[upline].directRefs.push(msg.sender);
+        }
+        
+        // ✅ FIX #1: Update network sizes FIRST to unlock levels
+        if (upline != address(0)) {
+            _updateNetworkSizes(upline);
+        }
+        
+        // ✅ FIX #2: Distribute payments AFTER levels are unlocked
+        _distributePayments(msg.sender, totalAmount);
+        
+        // Process matrix entries AFTER reserves are credited
+        for (uint256 i = 0; i < entries; i++) {
+            _createMatrixNode(msg.sender);
+        }
+        
+        emit UserRegistered(msg.sender, upline, totalAmount);
+    }
+    
+    function topupMatrix(uint256 entries) external validUser {
+        require(entries > 0 && entries <= 100, "Invalid entries count");
+        
+        uint256 totalAmount = PACKAGE_PRICE * entries;
+        
+        require(
+            usdtToken.transferFrom(msg.sender, address(this), totalAmount),
+            "USDT transfer failed"
+        );
+        
+        users[msg.sender].matrixEntries += entries;
+        
+        _distributePayments(msg.sender, totalAmount);
+        
+        for (uint256 i = 0; i < entries; i++) {
+            _createMatrixNode(msg.sender);
+        }
+    }
+    
+    function withdraw(uint256 amount) external validUser nonReentrant {
+        require(amount > 0, "Invalid amount");
+        require(users[msg.sender].totalEarnings >= amount, "Insufficient balance");
+        
+        uint256 currentDay = block.timestamp / 1 days;
+        if (lastWithdrawalDay[msg.sender] != currentDay) {
+            dailyWithdrawn[msg.sender] = 0;
+            lastWithdrawalDay[msg.sender] = currentDay;
+        }
+        
+        require(
+            dailyWithdrawn[msg.sender] + amount <= maxDailyWithdrawals,
+            "Daily withdrawal limit exceeded"
+        );
+        
+        users[msg.sender].totalEarnings -= amount;
+        dailyWithdrawn[msg.sender] += amount;
+        
+        require(
+            usdtToken.transfer(msg.sender, amount),
+            "Transfer failed"
+        );
+        
+        emit Withdrawal(msg.sender, amount);
+    }
+    
+    function _createMatrixNode(address user) internal {
+        while (nextPlacementIndex < matrixNodes.length && 
+               matrixNodes[nextPlacementIndex].children >= uint8(MATRIX_SIZE)) {
+            nextPlacementIndex++;
+        }
+        
+        require(nextPlacementIndex < matrixNodes.length, "No available parent");
+        
+        uint256 parentId = nextPlacementIndex;
+        uint256 nodeId = matrixNodes.length;
+        address matrixOwner = matrixNodes[parentId].user;
+        
+        matrixNodes.push(MatrixNode({
+            user: user,
+            parentId: parentId,
+            children: 0,
+            completed: false,
+            timestamp: block.timestamp
+        }));
+        
+        matrixNodes[parentId].children++;
+        userMatrixNodes[user].push(nodeId);
+        
+        uint256 matrixPayout = (PACKAGE_PRICE * 40) / 100;
+        
+        if (matrixOwner != address(0)) {
+            require(totalReserves >= matrixPayout, "Insufficient matrix reserves");
+            totalReserves -= matrixPayout;
+            totalMatrixPayouts += matrixPayout;
+            
+            users[matrixOwner].totalEarnings += matrixPayout;
+            users[matrixOwner].matrixPayouts++;
+            
+            emit MatrixPayout(matrixOwner, user, parentId, matrixPayout);
+        } else {
+            require(totalReserves >= matrixPayout, "Insufficient matrix reserves");
+            totalReserves -= matrixPayout;
+            totalRankRewardPool += matrixPayout;
+        }
+        
+        emit MatrixEntry(user, nodeId, parentId);
+        
+        if (matrixNodes[parentId].children >= uint8(MATRIX_SIZE)) {
+            matrixNodes[parentId].completed = true;
+            emit MatrixCompleted(matrixOwner, parentId, PACKAGE_PRICE * 2);
+        }
+    }
+    
+    function _distributePayments(address newUser, uint256 totalAmount) internal {
+        uint256 companyShare = (totalAmount * 11) / 100;
+        uint256 matrixReserve = (totalAmount * 40) / 100;
+        uint256 rankRewardPool = (totalAmount * 1) / 100;
+        uint256 commissionTotal = (totalAmount * 48) / 100;
+        
+        totalReserves += matrixReserve;
+        totalRankRewardPool += rankRewardPool;
+        
+        require(
+            usdtToken.transfer(companyWallet, companyShare),
+            "Company payment failed"
+        );
+        
+        emit CompanyPayment(companyWallet, companyShare);
+        
+        _distributeCommissions(newUser, totalAmount, commissionTotal);
+        
+        emit ReserveUpdate(totalReserves, usdtToken.balanceOf(address(this)));
+    }
+    
+    // ✅ FIX #2: Calculate commissions from totalAmount, not from pool
+    function _distributeCommissions(address newUser, uint256 totalAmount, uint256 commissionTotal) internal {
+        address current = users[newUser].upline;
+        uint256 distributed = 0;
+        
+        for (uint8 level = 0; level < uint8(MAX_LEVEL) && current != address(0); level++) {
+            if (users[current].active && users[current].unlockedLevels > level) {
+                // ✅ FIXED: Calculate from totalAmount, not commissionTotal
+                uint256 commission = (totalAmount * levelCommissions[level]) / 10000;
+                
+                users[current].totalEarnings += commission;
+                distributed += commission;
+                totalCommissionsPaid += commission;
+                
+                emit CommissionPaid(current, newUser, commission, level + 1);
+            }
+            current = users[current].upline;
+        }
+        
+        // Transfer undistributed to company
+        if (distributed < commissionTotal) {
+            uint256 remaining = commissionTotal - distributed;
+            
+            require(
+                usdtToken.transfer(companyWallet, remaining),
+                "Remaining commission transfer failed"
+            );
+            
+            emit CompanyPayment(companyWallet, remaining);
+        }
+    }
+    
+    function _updateNetworkSizes(address user) internal {
+        address current = user;
+        uint8 level = 0;
+        
+        while (current != address(0) && level < 10) {
+            users[current].networkSize++;
+            
+            if (level < 10) {
+                users[current].levelCounts[level]++;
+            }
+            
+            _checkRankUpgrade(current);
+            current = users[current].upline;
+            level++;
+        }
+    }
+    
+    function _checkRankUpgrade(address user) internal {
+        uint8 oldRank = users[user].rank;
+        uint8 highestQualifiedRank = 0;
+        
+        for (uint8 star = 0; star < 9; star++) {
+            bool qualifiedForRank = true;
+            
+            for (uint8 level = 0; level < 9; level++) {
+                uint256 required = rankLevelRequirements[star][level];
+                if (required > 0) {
+                    if (users[user].levelCounts[level] < required) {
+                        qualifiedForRank = false;
+                        break;
+                    }
+                }
+            }
+            
+            if (qualifiedForRank) {
+                highestQualifiedRank = star + 1;
+            } else {
+                break;
+            }
+        }
+        
+        for (uint8 rank = 1; rank <= highestQualifiedRank; rank++) {
+            if (!rankRewardClaimed[user][rank]) {
+                _payRankReward(user, rank);
+            }
+        }
+        
+        if (highestQualifiedRank > oldRank) {
+            users[user].rank = highestQualifiedRank;
+            emit RankUpgraded(user, highestQualifiedRank);
+        }
+        
+        uint256 directCount = users[user].directRefs.length;
+        if (directCount > users[user].unlockedLevels && directCount <= MAX_LEVEL && directCount <= 255) {
+            users[user].unlockedLevels = uint8(directCount);
+        }
+    }
+    
+    function _payRankReward(address user, uint8 rank) internal {
+        if (rank == 0 || rank > 9) return;
+        
+        uint256 rewardAmount = rankRewardAmounts[rank - 1];
+        
+        if (totalRankRewardPool >= rewardAmount) {
+            totalRankRewardPool -= rewardAmount;
+            totalRankRewardsPaid += rewardAmount;
+            
+            users[user].totalEarnings += rewardAmount;
+            
+            rankRewardClaimed[user][rank] = true;
+            
+            emit RankRewardPaid(user, rank, rewardAmount);
+        }
+    }
+    
+    function getUser(address user) external view returns (
+        address upline,
+        uint256 totalEarnings,
+        uint256 networkSize,
+        uint256 matrixEntries,
+        uint256 matrixPayouts,
+        uint8 rank,
+        uint8 unlockedLevels,
+        bool active,
+        uint256 directRefs
+    ) {
+        User storage u = users[user];
+        return (
+            u.upline,
+            u.totalEarnings,
+            u.networkSize,
+            u.matrixEntries,
+            u.matrixPayouts,
+            u.rank,
+            u.unlockedLevels,
+            u.active,
+            u.directRefs.length
+        );
+    }
+    
+    function getPlatformStats() external view returns (
+        uint256 _totalUsers,
+        uint256 _activeUsers,
+        uint256 _totalCommissionsPaid,
+        uint256 _totalMatrixPayouts
+    ) {
+        return (
+            totalUsers,
+            activeUsers,
+            totalCommissionsPaid,
+            totalMatrixPayouts
+        );
+    }
+    
+    function getFinancialStats() external view returns (
+        uint256 reserves,
+        uint256 totalCommissions,
+        uint256 totalMatrixPaid,
+        uint256 contractBalance,
+        uint256 dailyWithdrawLimit
+    ) {
+        return (
+            totalReserves,
+            totalCommissionsPaid,
+            totalMatrixPayouts,
+            usdtToken.balanceOf(address(this)),
+            maxDailyWithdrawals
+        );
+    }
+    
+    function getUserMatrixNodes(address user) external view returns (uint256[] memory) {
+        return userMatrixNodes[user];
+    }
+    
+    function getDirectReferrals(address user) external view returns (address[] memory) {
+        return users[user].directRefs;
+    }
+    
+    function getMatrixNode(uint256 nodeId) external view returns (
+        address user,
+        uint256 parentId,
+        uint8 children,
+        bool completed,
+        uint256 timestamp
+    ) {
+        require(nodeId < matrixNodes.length, "Invalid node ID");
+        MatrixNode storage node = matrixNodes[nodeId];
+        return (node.user, node.parentId, node.children, node.completed, node.timestamp);
+    }
+}
